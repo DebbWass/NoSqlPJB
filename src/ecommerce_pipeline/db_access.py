@@ -47,7 +47,90 @@ class DBAccess:
         is saved for read access, and downstream counters and graph edges are
         updated (best-effort, does not roll back the order on failure).
         """
-        raise NotImplementedError("Phase 1: implement create_order")
+        """
+        מימוש טרנזקציוני ב-Postgres עם גיבוי Snapshot ב-MongoDB.
+        """
+        with self._pg_session_factory() as session:
+            try:
+                # שימוש ב-Context Manager של SQLAlchemy לניהול הטרנזקציה (BEGIN/COMMIT/ROLLBACK)
+                with session.begin():
+                    order_items_prepared = []
+                    total_amount = 0.0
+
+                    for item in items:
+                        p_id = item['product_id']
+                        qty = item['quantity']
+
+                        # נעילת שורה (SELECT FOR UPDATE) למניעת Race Conditions במלאי
+                        product = session.execute(
+                            select(Product).filter_by(id=p_id).with_for_update()
+                        ).scalar_one_or_none()
+
+                        if not product:
+                            raise ValueError(f"Product {p_id} not found")
+                        
+                        if product.stock_quantity < qty:
+                            raise ValueError(f"Insufficient stock for product: {product.name}")
+
+                        # עדכון מלאי
+                        product.stock_quantity -= qty
+                        
+                        unit_price = float(product.price)
+                        total_amount += unit_price * qty
+
+                        order_items_prepared.append({
+                            "product_id": p_id,
+                            "product_name": product.name,
+                            "quantity": qty,
+                            "unit_price": unit_price
+                        })
+
+                    # יצירת ההזמנה
+                    new_order = Order(
+                        customer_id=customer_id,
+                        total_amount=total_amount,
+                        status="completed"
+                    )
+                    session.add(new_order)
+                    session.flush() # קבלת ה-ID מבלי לסיים את הטרנזקציה
+
+                    # יצירת פריטי ההזמנה
+                    for oi in order_items_prepared:
+                        session.add(OrderItem(
+                            order_id=new_order.id,
+                            product_id=oi["product_id"],
+                            quantity=oi["quantity"],
+                            unit_price=oi["unit_price"]
+                        ))
+
+                # --- סיום טרנזקציית Postgres ---
+                
+                # שליפת פרטי לקוח עבור ה-Snapshot
+                customer = session.get(Customer, customer_id)
+                created_at_str = new_order.created_at.isoformat()
+
+                # שמירה ב-MongoDB (Best-effort)
+                self.save_order_snapshot(
+                    order_id=new_order.id,
+                    customer={"id": customer.id, "name": customer.name, "email": customer.email},
+                    items=order_items_prepared,
+                    total_amount=total_amount,
+                    status=new_order.status,
+                    created_at=created_at_str
+                )
+
+                return {
+                    "order_id": new_order.id,
+                    "customer_id": customer_id,
+                    "status": new_order.status,
+                    "total_amount": total_amount,
+                    "created_at": created_at_str,
+                    "items": order_items_prepared
+                }
+
+            except Exception as e:
+                logger.error(f"Order creation failed: {e}")
+                raise
 
     def get_product(self, product_id: int) -> dict | None:
         """Fetch a product by its integer ID.
@@ -62,7 +145,23 @@ class DBAccess:
           food:        {weight_g, organic, allergens}
           home:        {dimensions, material, assembly_required}
         """
-        raise NotImplementedError("Phase 1: implement get_product")
+        # Query MongoDB for the product
+        product = self._mongo_db.products.find_one({"id": product_id})
+        
+        # Return None if product not found
+        if product is None:
+            return None
+            
+        # Convert MongoDB document to dict and return
+        return {
+            "id": product["id"],
+            "name": product["name"],
+            "price": product["price"],
+            "stock_quantity": product["stock_quantity"],
+            "category": product["category"],
+            "description": product["description"],
+            "category_fields": product["category_fields"]
+        }
 
     def search_products(
         self,
@@ -76,7 +175,36 @@ class DBAccess:
         Both filters are ANDed together. Returns all products if both are None.
         Returns a list of product dicts (same shape as get_product).
         """
-        raise NotImplementedError("Phase 1: implement search_products")
+        # Build MongoDB query
+        query = {}
+        filters = []
+        
+        if category is not None:
+            filters.append({"category": category})
+        
+        if q is not None:
+            # Case-insensitive substring search
+            filters.append({"name": {"$regex": q, "$options": "i"}})
+        
+        if filters:
+            if len(filters) == 1:
+                query = filters[0]
+            else:
+                query = {"$and": filters}
+        
+        # Query MongoDB
+        products = list(self._mongo_db.products.find(query))
+        
+        # Convert to the expected format
+        return [{
+            "id": product["id"],
+            "name": product["name"],
+            "price": product["price"],
+            "stock_quantity": product["stock_quantity"],
+            "category": product["category"],
+            "description": product["description"],
+            "category_fields": product["category_fields"]
+        } for product in products]
 
     def save_order_snapshot(
         self,
@@ -101,7 +229,19 @@ class DBAccess:
         Called internally by create_order after the transactional write
         commits. Not called directly by routes.
         """
-        raise NotImplementedError("Phase 1: implement save_order_snapshot")
+        # Create denormalized snapshot document
+        snapshot = {
+            "order_id": order_id,
+            "customer": customer,
+            "items": items,
+            "total_amount": total_amount,
+            "status": status,
+            "created_at": created_at
+        }
+        
+        # Insert into MongoDB and return the document ID as string
+        result = self._mongo_db.orders.insert_one(snapshot)
+        return str(result.inserted_id)
 
     def get_order(self, order_id: int) -> dict | None:
         """Fetch a single order snapshot by order_id.
@@ -109,7 +249,16 @@ class DBAccess:
         Returns the snapshot dict (order_id, customer embed, items list,
         total_amount, status, created_at) or None if not found.
         """
-        raise NotImplementedError("Phase 1: implement get_order")
+        # Query MongoDB for the order snapshot
+        order = self._mongo_db.orders.find_one({"order_id": order_id})
+        
+        # Return None if not found, otherwise return the snapshot
+        if order is None:
+            return None
+        
+        # Remove MongoDB's _id field and return the snapshot
+        order.pop("_id", None)
+        return order
 
     def get_order_history(self, customer_id: int) -> list[dict]:
         """Fetch all order snapshots for a customer.
@@ -117,7 +266,16 @@ class DBAccess:
         Returns a list of snapshot dicts sorted by created_at descending.
         Returns an empty list if the customer has no orders.
         """
-        raise NotImplementedError("Phase 1: implement get_order_history")
+        # Query MongoDB for all orders by this customer, sorted by created_at descending
+        orders = list(self._mongo_db.orders.find(
+            {"customer.id": customer_id}
+        ).sort("created_at", -1))  # -1 for descending
+        
+        # Remove MongoDB's _id field from each order
+        for order in orders:
+            order.pop("_id", None)
+        
+        return orders
 
     def revenue_by_category(self) -> list[dict]:
         """Compute total revenue per product category.
@@ -125,7 +283,31 @@ class DBAccess:
         Returns [{"category": str, "total_revenue": float}, ...] sorted by
         total_revenue descending.
         """
-        raise NotImplementedError("Phase 1: implement revenue_by_category")
+        from sqlalchemy import func
+        from ecommerce_pipeline.postgres_models import Product, OrderItem
+        
+        with self._pg_session_factory() as session:
+            # Query: Sum revenue by category
+            # revenue = order_item.quantity * order_item.unit_price
+            results = session.query(
+                Product.category,
+                func.sum(OrderItem.quantity * OrderItem.unit_price).label("total_revenue")
+            ).join(
+                OrderItem, Product.id == OrderItem.product_id
+            ).group_by(
+                Product.category
+            ).order_by(
+                func.sum(OrderItem.quantity * OrderItem.unit_price).desc()
+            ).all()
+            
+            # Convert to list of dicts
+            return [
+                {
+                    "category": category,
+                    "total_revenue": float(total_revenue) if total_revenue else 0.0
+                }
+                for category, total_revenue in results
+            ]
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
 
