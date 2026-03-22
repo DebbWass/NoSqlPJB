@@ -13,6 +13,15 @@ import json
 import logging
 from itertools import combinations
 
+from sqlalchemy import select
+
+from ecommerce_pipeline.postgres_models import (
+    Customer,
+    Product,
+    Order,
+    OrderItem,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,12 +56,8 @@ class DBAccess:
         is saved for read access, and downstream counters and graph edges are
         updated (best-effort, does not roll back the order on failure).
         """
-        """
-        מימוש טרנזקציוני ב-Postgres עם גיבוי Snapshot ב-MongoDB.
-        """
         with self._pg_session_factory() as session:
             try:
-                # שימוש ב-Context Manager של SQLAlchemy לניהול הטרנזקציה (BEGIN/COMMIT/ROLLBACK)
                 with session.begin():
                     order_items_prepared = []
                     total_amount = 0.0
@@ -61,20 +66,17 @@ class DBAccess:
                         p_id = item['product_id']
                         qty = item['quantity']
 
-                        # נעילת שורה (SELECT FOR UPDATE) למניעת Race Conditions במלאי
                         product = session.execute(
                             select(Product).filter_by(id=p_id).with_for_update()
                         ).scalar_one_or_none()
 
                         if not product:
                             raise ValueError(f"Product {p_id} not found")
-                        
+
                         if product.stock_quantity < qty:
                             raise ValueError(f"Insufficient stock for product: {product.name}")
 
-                        # עדכון מלאי
                         product.stock_quantity -= qty
-                        
                         unit_price = float(product.price)
                         total_amount += unit_price * qty
 
@@ -82,42 +84,75 @@ class DBAccess:
                             "product_id": p_id,
                             "product_name": product.name,
                             "quantity": qty,
-                            "unit_price": unit_price
+                            "unit_price": unit_price,
                         })
 
-                    # יצירת ההזמנה
                     new_order = Order(
                         customer_id=customer_id,
                         total_amount=total_amount,
-                        status="completed"
+                        status="completed",
                     )
                     session.add(new_order)
-                    session.flush() # קבלת ה-ID מבלי לסיים את הטרנזקציה
+                    session.flush()
 
-                    # יצירת פריטי ההזמנה
                     for oi in order_items_prepared:
                         session.add(OrderItem(
                             order_id=new_order.id,
                             product_id=oi["product_id"],
                             quantity=oi["quantity"],
-                            unit_price=oi["unit_price"]
+                            unit_price=oi["unit_price"],
                         ))
 
-                # --- סיום טרנזקציית Postgres ---
-                
-                # שליפת פרטי לקוח עבור ה-Snapshot
+                # Postgres transaction committed at this point
                 customer = session.get(Customer, customer_id)
                 created_at_str = new_order.created_at.isoformat()
 
-                # שמירה ב-MongoDB (Best-effort)
+                # MongoDB snapshot (best-effort)
                 self.save_order_snapshot(
                     order_id=new_order.id,
                     customer={"id": customer.id, "name": customer.name, "email": customer.email},
                     items=order_items_prepared,
                     total_amount=total_amount,
                     status=new_order.status,
-                    created_at=created_at_str
+                    created_at=created_at_str,
                 )
+
+                # MongoDB product stock sync (best-effort)
+                for oi in order_items_prepared:
+                    try:
+                        self._mongo_db.product_catalog.update_one(
+                            {"id": oi["product_id"]},
+                            {"$inc": {"stock_quantity": -oi["quantity"]}}
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Failed to sync stock to MongoDB for product {oi['product_id']}: {exc}")
+
+                # Redis inventory counter update (best-effort)
+                if self._redis is not None:
+                    for oi in order_items_prepared:
+                        key = f"inventory:{oi['product_id']}"
+                        try:
+                            self._redis.decrby(key, oi['quantity'])
+                        except Exception as exc:
+                            logger.warning(f"Failed to decrement inventory counter {key}: {exc}")
+
+                        # Invalidate/update product cache in Redis
+                        try:
+                            self.invalidate_product_cache(oi["product_id"])
+                        except Exception as exc:
+                            logger.warning(f"Failed to invalidate cache for product {oi['product_id']}: {exc}")
+
+                # Neo4j graph update (best-effort)
+                if self._neo4j is not None:
+                    try:
+                        self.seed_recommendation_graph([
+                            {
+                                "order_id": new_order.id,
+                                "product_ids": [oi["product_id"] for oi in order_items_prepared],
+                            }
+                        ])
+                    except Exception as exc:
+                        logger.warning(f"Failed to update recommendation graph: {exc}")
 
                 return {
                     "order_id": new_order.id,
@@ -125,7 +160,7 @@ class DBAccess:
                     "status": new_order.status,
                     "total_amount": total_amount,
                     "created_at": created_at_str,
-                    "items": order_items_prepared
+                    "items": order_items_prepared,
                 }
 
             except Exception as e:
@@ -145,23 +180,39 @@ class DBAccess:
           food:        {weight_g, organic, allergens}
           home:        {dimensions, material, assembly_required}
         """
+        # Cache-aside in Redis (if available)
+        cache_key = f"product:{product_id}"
+        if self._redis is not None:
+            raw = self._redis.get(cache_key)
+            if raw is not None:
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    self._redis.delete(cache_key)
+
         # Query MongoDB for the product
-        product = self._mongo_db.products.find_one({"id": product_id})
-        
-        # Return None if product not found
+        product = self._mongo_db.product_catalog.find_one({"id": product_id})
+
         if product is None:
             return None
-            
-        # Convert MongoDB document to dict and return
-        return {
+
+        payload = {
             "id": product["id"],
             "name": product["name"],
             "price": product["price"],
             "stock_quantity": product["stock_quantity"],
             "category": product["category"],
-            "description": product["description"],
-            "category_fields": product["category_fields"]
+            "description": product.get("description"),
+            "category_fields": product.get("category_fields", {}),
         }
+
+        if self._redis is not None:
+            try:
+                self._redis.set(cache_key, json.dumps(payload), ex=300)
+            except Exception as exc:
+                logger.warning(f"Failed to write product cache {cache_key}: {exc}")
+
+        return payload
 
     def search_products(
         self,
@@ -193,7 +244,7 @@ class DBAccess:
                 query = {"$and": filters}
         
         # Query MongoDB
-        products = list(self._mongo_db.products.find(query))
+        products = list(self._mongo_db.product_catalog.find(query))
         
         # Convert to the expected format
         return [{
@@ -240,7 +291,7 @@ class DBAccess:
         }
         
         # Insert into MongoDB and return the document ID as string
-        result = self._mongo_db.orders.insert_one(snapshot)
+        result = self._mongo_db["order_snapshots"].insert_one(snapshot)
         return str(result.inserted_id)
 
     def get_order(self, order_id: int) -> dict | None:
@@ -250,7 +301,7 @@ class DBAccess:
         total_amount, status, created_at) or None if not found.
         """
         # Query MongoDB for the order snapshot
-        order = self._mongo_db.orders.find_one({"order_id": order_id})
+        order = self._mongo_db["order_snapshots"].find_one({"order_id": order_id})
         
         # Return None if not found, otherwise return the snapshot
         if order is None:
@@ -267,7 +318,7 @@ class DBAccess:
         Returns an empty list if the customer has no orders.
         """
         # Query MongoDB for all orders by this customer, sorted by created_at descending
-        orders = list(self._mongo_db.orders.find(
+        orders = list(self._mongo_db["order_snapshots"].find(
             {"customer.id": customer_id}
         ).sort("created_at", -1))  # -1 for descending
         
@@ -317,7 +368,15 @@ class DBAccess:
         For each product, write its current stock_quantity to the counter
         store. Called at startup and after seeding products.
         """
-        raise NotImplementedError("Phase 2: implement init_inventory_counters")
+        if self._redis is None:
+            return
+
+        from ecommerce_pipeline.postgres_models import Product
+
+        with self._pg_session_factory() as session:
+            products = session.query(Product).all()
+            for product in products:
+                self._redis.set(f"inventory:{product.id}", str(product.stock_quantity))
 
     def invalidate_product_cache(self, product_id: int) -> None:
         """Remove a product's cached entry.
@@ -325,7 +384,10 @@ class DBAccess:
         Call this after updating a product's data so the next read fetches
         fresh data from the primary store. No-op if no entry exists.
         """
-        raise NotImplementedError("Phase 2: implement invalidate_product_cache")
+        if self._redis is None:
+            return
+
+        self._redis.delete(f"product:{product_id}")
 
     def record_product_view(self, customer_id: int, product_id: int) -> None:
         """Record that a customer viewed a product.
@@ -333,7 +395,12 @@ class DBAccess:
         Maintains a bounded, ordered list of the customer's most recently
         viewed products (most recent first, capped at 10 entries).
         """
-        raise NotImplementedError("Phase 2: implement record_product_view")
+        if self._redis is None:
+            return
+
+        key = f"recently_viewed:{customer_id}"
+        self._redis.lpush(key, str(product_id))
+        self._redis.ltrim(key, 0, 9)
 
     def get_recently_viewed(self, customer_id: int) -> list[int]:
         """Return up to 10 recently viewed product IDs for a customer.
@@ -341,7 +408,15 @@ class DBAccess:
         Returns IDs as integers, most recently viewed first.
         Returns an empty list if no views have been recorded.
         """
-        raise NotImplementedError("Phase 2: implement get_recently_viewed")
+        if self._redis is None:
+            return []
+
+        key = f"recently_viewed:{customer_id}"
+        values = self._redis.lrange(key, 0, 9)
+        if not values:
+            return []
+
+        return [int(v) for v in values]
 
     # ── Phase 3 ───────────────────────────────────────────────────────────────
 
@@ -356,7 +431,41 @@ class DBAccess:
 
         Products not found in the catalog are silently skipped.
         """
-        raise NotImplementedError("Phase 3: implement seed_recommendation_graph")
+        if self._neo4j is None:
+            return
+
+        # Gather product names from Postgres for node labels / graph readability
+        name_by_id = {}
+        with self._pg_session_factory() as session:
+            for order in orders:
+                for pid in set(order.get("product_ids", [])):
+                    if pid in name_by_id:
+                        continue
+                    product = session.get(Product, pid)
+                    if product:
+                        name_by_id[pid] = product.name
+
+        with self._neo4j.session() as session:
+            for order in orders:
+                product_ids = sorted(set(order.get("product_ids", [])))
+                for pid in product_ids:
+                    session.run(
+                        "MERGE (p:Product {id: $id}) SET p.name = COALESCE($name, p.name)",
+                        id=pid,
+                        name=name_by_id.get(pid, f"Product {pid}"),
+                    )
+
+                for (a, b) in combinations(product_ids, 2):
+                    session.run(
+                        ""
+                        "MATCH (a:Product {id: $id_a}), (b:Product {id: $id_b})\n"
+                        "MERGE (a)-[r:BOUGHT_TOGETHER]-(b)\n"
+                        "ON CREATE SET r.weight = 1\n"
+                        "ON MATCH SET r.weight = r.weight + 1"
+                        "",
+                        id_a=a,
+                        id_b=b,
+                    )
 
     def get_recommendations(self, product_id: int, limit: int = 5) -> list[dict]:
         """Return product recommendations based on co-purchase patterns.
@@ -366,4 +475,24 @@ class DBAccess:
 
         Returns an empty list if the product has no co-purchase relationships.
         """
-        raise NotImplementedError("Phase 3: implement get_recommendations")
+        if self._neo4j is None:
+            return []
+
+        with self._neo4j.session() as session:
+            result = session.run(
+                ""
+                "MATCH (p:Product {id: $id})-[r:BOUGHT_TOGETHER]-(other:Product)\n"
+                "WHERE other.id <> $id\n"
+                "RETURN other.id AS product_id, other.name AS name, r.weight AS score\n"
+                "ORDER BY r.weight DESC\n"
+                "LIMIT $limit"
+                "",
+                id=product_id,
+                limit=limit,
+            )
+            records = result.data()
+
+        return [
+            {"product_id": rec["product_id"], "name": rec["name"], "score": int(rec["score"])}
+            for rec in records
+        ]
