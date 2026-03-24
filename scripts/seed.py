@@ -133,6 +133,21 @@ def seed_phase1() -> None:
     print(f"  MongoDB:  inserted {inserted_mongo} products into product_catalog")
 
 
+def seed(phase: str = "all") -> None:
+    """Entrypoint for seeding from external callers.
+
+    phase may be "1", "2", "3", or "all".
+    """
+    phases = ["1", "2", "3"] if phase == "all" else [phase]
+    for p in phases:
+        if p == "1":
+            seed_phase1()
+        elif p == "2":
+            seed_phase2()
+        elif p == "3":
+            seed_phase3()
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Redis inventory counters
 # ---------------------------------------------------------------------------
