@@ -60,9 +60,12 @@ def migrate() -> None:
 
     product_catalog = mongo_db["product_catalog"]
     product_catalog.create_index([("id", 1)], unique=True)
+    product_catalog.create_index([("category", 1)])
+    product_catalog.create_index([("name", "text")])
 
     order_snapshots = mongo_db["order_snapshots"]
     order_snapshots.create_index([("order_id", 1)], unique=True)
+    order_snapshots.create_index([("customer.id", 1)])
 
     print("MongoDB: created indexes")
 

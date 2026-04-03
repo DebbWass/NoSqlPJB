@@ -103,12 +103,14 @@ class DBAccess:
                             unit_price=oi["unit_price"],
                         ))
 
-                # Postgres transaction committed at this point
+                # Postgres transaction committed at this point.
+                # Refresh to load server_default values (e.g. created_at) from DB.
+                session.refresh(new_order)
                 customer = session.get(Customer, customer_id)
                 created_at_str = new_order.created_at.isoformat()
 
                 # MongoDB snapshot (best-effort)
-                self.save_order_snapshot(
+                self._save_order_snapshot(
                     order_id=new_order.id,
                     customer={"id": customer.id, "name": customer.name, "email": customer.email},
                     items=order_items_prepared,
@@ -257,7 +259,7 @@ class DBAccess:
             "category_fields": product["category_fields"]
         } for product in products]
 
-    def save_order_snapshot(
+    def _save_order_snapshot(
         self,
         order_id: int,
         customer: dict,
@@ -335,29 +337,20 @@ class DBAccess:
         total_revenue descending.
         """
         from sqlalchemy import func
-        from ecommerce_pipeline.postgres_models import Product, OrderItem
-        
+
+        revenue_expr = func.sum(OrderItem.quantity * OrderItem.unit_price)
+
         with self._pg_session_factory() as session:
-            # Query: Sum revenue by category
-            # revenue = order_item.quantity * order_item.unit_price
-            results = session.query(
-                Product.category,
-                func.sum(OrderItem.quantity * OrderItem.unit_price).label("total_revenue")
-            ).join(
-                OrderItem, Product.id == OrderItem.product_id
-            ).group_by(
-                Product.category
-            ).order_by(
-                func.sum(OrderItem.quantity * OrderItem.unit_price).desc()
+            rows = session.execute(
+                select(Product.category, revenue_expr.label("total_revenue"))
+                .join(OrderItem, Product.id == OrderItem.product_id)
+                .group_by(Product.category)
+                .order_by(revenue_expr.desc())
             ).all()
-            
-            # Convert to list of dicts
+
             return [
-                {
-                    "category": category,
-                    "total_revenue": float(total_revenue) if total_revenue else 0.0
-                }
-                for category, total_revenue in results
+                {"category": row.category, "total_revenue": float(row.total_revenue or 0)}
+                for row in rows
             ]
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
@@ -434,16 +427,13 @@ class DBAccess:
         if self._neo4j is None:
             return
 
-        # Gather product names from Postgres for node labels / graph readability
-        name_by_id = {}
+        # Gather all unique product IDs across all orders, then fetch in one query
+        all_pids = {pid for order in orders for pid in order.get("product_ids", [])}
         with self._pg_session_factory() as session:
-            for order in orders:
-                for pid in set(order.get("product_ids", [])):
-                    if pid in name_by_id:
-                        continue
-                    product = session.get(Product, pid)
-                    if product:
-                        name_by_id[pid] = product.name
+            products = session.execute(
+                select(Product).where(Product.id.in_(all_pids))
+            ).scalars().all()
+            name_by_id = {p.id: p.name for p in products}
 
         with self._neo4j.session() as session:
             for order in orders:

@@ -86,8 +86,16 @@ uv sync
 ### 3. Run the API server
 
 ```bash
-uv run uvicorn ecommerce_pipeline.api.app:app --reload
+uv run serve-api
 ```
+
+If you are standing in the outer workspace folder (`/home/dorit/NoSqlPJB`) instead of the project folder (`/home/dorit/NoSqlPJB/NoSqlPJB`), run:
+
+```bash
+uv run --project NoSqlPJB serve-api
+```
+
+Avoid launching a globally installed `uvicorn` binary. If `uvicorn` resolves to `~/.local/...` instead of `NoSqlPJB/.venv/...`, startup will fail with `ModuleNotFoundError: No module named 'ecommerce_pipeline'`.
 
 Open http://localhost:8000/docs to see all available endpoints. Every endpoint already exists — they will return `501 Not Implemented` until you implement the corresponding `DBAccess` method.
 

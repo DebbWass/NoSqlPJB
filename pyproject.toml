@@ -34,6 +34,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 seed = "scripts.seed:main"
+serve-api = "ecommerce_pipeline.api.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ecommerce_pipeline"]
