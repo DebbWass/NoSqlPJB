@@ -110,7 +110,7 @@ class DBAccess:
                 created_at_str = new_order.created_at.isoformat()
 
                 # MongoDB snapshot (best-effort)
-                self._save_order_snapshot(
+                self.save_order_snapshot(
                     order_id=new_order.id,
                     customer={"id": customer.id, "name": customer.name, "email": customer.email},
                     items=order_items_prepared,
@@ -259,7 +259,7 @@ class DBAccess:
             "category_fields": product["category_fields"]
         } for product in products]
 
-    def _save_order_snapshot(
+    def save_order_snapshot(
         self,
         order_id: int,
         customer: dict,
